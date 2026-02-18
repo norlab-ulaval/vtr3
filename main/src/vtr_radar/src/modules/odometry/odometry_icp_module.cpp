@@ -189,6 +189,10 @@ void OdometryICPModule::run_(QueryCache &qdata0, OutputCache &,
 
 
   CLOG(DEBUG, "radar.odometry_icp") << "Timestamps of concern frame stamp: " << (scan_stamp - timestamp_prior) /1e9 << " timestamp_end " << (frame_end_time - timestamp_prior) /1e9;
+  if (scan_stamp < timestamp_prior) {
+    CLOG(WARNING, "radar.odometry_icp") << "Radar scan occurs before the last scan ended. Undefined condition";
+    CLOG(WARNING, "radar.odometry_icp") << "Timestamps of concern frame stamp: " << (scan_stamp - timestamp_prior) /1e9 << " timestamp_end " << (frame_end_time - timestamp_prior) /1e9;
+  }
 
   // clang-format off
   /// trajectory smoothing
@@ -208,7 +212,7 @@ void OdometryICPModule::run_(QueryCache &qdata0, OutputCache &,
   for (int i = 0; i < num_states; ++i) {
     // Load in explicit end_time in case there is small rounding issues
     const int64_t knot_time_stamp = (i == num_states - 1) ? frame_end_time : frame_start_time + i * time_diff;
-    Time knot_time(static_cast<int64_t>(knot_time_stamp));
+    Time knot_time(knot_time_stamp);
     const Eigen::Matrix<double,6,1> xi_m_r_in_r_odo((knot_time - timestamp_prior).seconds() * w_m_r_in_r_odo_prior);
     const auto T_r_m_odo_extp = tactic::EdgeTransform(xi_m_r_in_r_odo) * T_r_m_odo_prior;
     const std::string T_r_m_var_name = "T_r_m_" + std::to_string(i);
@@ -647,7 +651,13 @@ void OdometryICPModule::run_(QueryCache &qdata0, OutputCache &,
          solver_failed) {
       // result
       Eigen::Matrix<double, 6, 6> T_r_m_cov = Eigen::Matrix<double, 6, 6>::Identity();
-      T_r_m_cov = trajectory->getCovariance(covariance, Time(static_cast<int64_t>(timestamp_odo_new))).block<6, 6>(0, 0);
+      try {
+        T_r_m_cov = trajectory->getCovariance(covariance, Time(static_cast<int64_t>(timestamp_odo_new))).block<6, 6>(0, 0);
+      } catch (std::runtime_error& e) {
+        CLOG(WARNING, "radar.odometry_icp") << "Getting the final covariance failed at scan time " << timestamp_odo_new << " " << e.what();
+        solver_failed = true;
+        break;
+      }
       T_r_m_icp = EdgeTransform(T_r_m_eval_extp->value(), T_r_m_cov);
 
       // Marginalize out all but last 2 states for prior
@@ -662,9 +672,16 @@ void OdometryICPModule::run_(QueryCache &qdata0, OutputCache &,
       Covariance covariance_marg(solver_marg);
       T_r_m_odo_prior_new =  trajectory->get(Time(static_cast<int64_t>(frame_end_time)))->pose()->evaluate();
       w_m_r_in_r_odo_prior_new = trajectory->get(Time(static_cast<int64_t>(frame_end_time)))->velocity()->evaluate();
-      cov_prior_new = trajectory->getCovariance(covariance_marg, Time(static_cast<int64_t>(frame_end_time))).block<12, 12>(0, 0);
-      cov_prior_new = 0.5 * (cov_prior_new + cov_prior_new.transpose());
-
+      
+      try {
+        cov_prior_new = trajectory->getCovariance(covariance_marg, Time(static_cast<int64_t>(frame_end_time))).block<12, 12>(0, 0);
+        cov_prior_new = 0.5 * (cov_prior_new + cov_prior_new.transpose());
+      } catch (std::runtime_error& e) {
+        CLOG(WARNING, "radar.odometry_icp") << "Getting the final covariance failed at end time " << frame_end_time << " " << e.what();
+        solver_failed = true;
+        break;
+      }
+      
       //
       matched_points_ratio = (float)filtered_sample_inds.size() / (float)sample_inds.size();
       //
